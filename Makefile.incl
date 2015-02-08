@@ -1,0 +1,20 @@
+######################################################################
+#  Makefile.incl
+######################################################################
+
+TOPDIR := $(dir $(CURDIR)/$(word $(words $(MAKEFILE_LIST)),$(MAKEFILE_LIST)))
+
+CXX             ?= g++
+CC              ?= gcc
+INCL            = -I.
+CXXFLAGS        = -std=c++0x -Wall -Wno-deprecated $(INCL)
+CFLAGS          = -Wall -Wno-deprecated $(INCL)
+OPTZ            ?= -g -O0
+
+.cpp.o:
+	$(CXX) -c $(CXXFLAGS) $(OPTZ) $< -o $*.o
+
+.c.o:
+	$(CC) -c $(CFLAGS) $(OPTZ) $< -o $*.o
+
+# End
