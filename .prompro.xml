@@ -1,0 +1,12 @@
+<prompro>
+	<serial device="/dev/cu.usbserial-A100MX3L" baud="2400" rtscts="1" />
+	<eproms>
+		<eprom type="27C256" use="256L,256U" segsize="32">
+			<segment use="256L" offset="0"/>
+			<segment use="256U" offset="32768"/>
+		</eprom>
+	</eproms>
+	<defaults
+		eprom="27C256"
+	/>
+</prompro>
