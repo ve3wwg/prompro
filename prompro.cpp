@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <ctype.h>
 #include <assert.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -20,13 +21,17 @@
 #include <map>
 #include <vector>
 
+static bool cmd_debug = false;			// When true, show serial trafic for debugging
 static bool xml_loaded = false;
+static bool verbose = false;			// Verbose messages when true
 static unsigned baud_rate = 0;
 static bool rtscts = false;
 static std::string device;
 static struct termios term;
 static int rtimeout_ms = 2000;			// Read timeout in ms
-static std::string	eprom_type;		// EPROM type
+static std::string eprom_type;			// EPROM type
+static std::string prompro_type;		// Current prompro-8 EPROM type
+static std::string download;			// Download file name
 
 static int serial = -1;
 
@@ -41,7 +46,23 @@ struct s_eprom_type {
 	std::vector<s_segment>	segs;		// Segment description
 };
 
+static s_eprom_type	*eprom = 0;		// Currently selected EPROM type
+
 static std::map<std::string,s_eprom_type> eproms;
+
+//////////////////////////////////////////////////////////////////////
+// Wait for any key
+//////////////////////////////////////////////////////////////////////
+
+static void
+anykey() {
+	char ch;
+	int rc;
+
+	do	{
+		rc = read(0,&ch,1);
+	} while ( rc == -1 && errno == EINTR );
+}
 
 //////////////////////////////////////////////////////////////////////
 // Poll for input:
@@ -54,12 +75,23 @@ static std::map<std::string,s_eprom_type> eproms;
 static int
 pollch(int timeout_ms) {
         struct pollfd pinfo;
+	int rc;
 
         pinfo.fd = serial;
         pinfo.events = POLLIN;
         pinfo.revents = 0;
 
-	return poll(&pinfo,1,timeout_ms);
+	rc = poll(&pinfo,1,timeout_ms);
+
+	if ( rc < 1 && cmd_debug ) {
+		fprintf(stderr,"poll(timeout=%d ms) returned %d",timeout_ms,rc);
+		if ( rc < 0 )
+			fprintf(stderr," (%s)\n",strerror(errno));
+		else	fputc('\n',stderr);
+		fflush(stderr);
+	}
+
+	return rc;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -87,6 +119,14 @@ readch(int timeout) {
 
 	assert(rc == 1);
 
+	if ( cmd_debug ) {
+		if ( isprint(ch) ) {
+			fprintf(stderr," <= '%c'\n",ch);
+		} else	{
+			fprintf(stderr," <= 0x%02X\n",ch);
+		}
+	}
+
 	return int(ch);
 }
 
@@ -99,7 +139,32 @@ writech(const char *data) {
 		rc = write(serial,data,n);
 	} while ( rc == -1 && errno == EINTR );
 	
+	if ( cmd_debug && n > 0 ) {
+		for ( int x=0; x<n; ++x ) {
+			char ch = data[x];
+
+			if ( isprint(ch) ) {
+				fprintf(stderr," => '%c'\n",ch);
+			} else	{
+				fprintf(stderr," => 0x%02X\n",ch);
+			}
+		}
+	}
+
 	assert(rc == rc);
+}
+
+static void
+writecr() {
+	writech("\r");
+}
+
+static void
+timeout(const char *message) {
+	fputs("TIMEOUT: ",stderr);
+	fputs(message,stderr);
+	fputs("\n",stderr);
+	exit(13);
 }
 
 static bool
@@ -110,12 +175,74 @@ get_prompt(int timeout_ms=0) {
 		timeout_ms = rtimeout_ms;
 
 	do	{
-		ch = readch(rtimeout_ms);
+		ch = readch(timeout_ms);
 		if ( ch == -1 )
 			return false;	// Timeout
 	} while ( ch != '*' );
 	
 	return true;
+}
+
+static void
+select_type(const char *type) {
+
+	writech("S");
+	writech(type);
+	writecr();
+	if ( !get_prompt(6000) )
+		timeout("Selecting PROMPRO EPROM type");
+}
+
+static void
+select_type(const s_segment& seg) {
+
+	if ( prompro_type != seg.ppname ) {
+		if ( verbose )
+			printf("Selecting PROMPRO type %s\n",seg.ppname.c_str());
+		select_type(seg.ppname.c_str());
+		prompro_type = seg.ppname;
+	} else	{
+		if ( verbose )
+			printf("Continuing to use PROMPRO type %s\n",seg.ppname.c_str());
+	}
+}
+
+static void
+select_type() {
+	
+	if ( eprom->segs.size() < 1 ) {
+		fprintf(stderr,"XML misconfiguration for EPROM type '%s'\n",
+			eprom->name.c_str());
+		exit(1);
+	}
+
+	s_segment& seg = eprom->segs[0];
+	select_type(seg);
+}
+
+
+static void
+download_file(const char *path) {
+	FILE *dfile = fopen(path,"w");
+
+	if ( !dfile ) {
+		fprintf(stderr,"%s: Opening file %s for write.\n",
+			strerror(errno),
+			path);
+		exit(2);
+	}
+
+	if ( verbose )
+		printf("Downloading EPROM to file '%s'\n",
+			download.c_str());
+
+	for ( auto it = eprom->segs.begin(); it != eprom->segs.end(); ++it ) {
+		const s_segment& seg = *it;
+
+		select_type(seg);
+	}
+
+	fclose(dfile);
 }
 
 static void
@@ -182,9 +309,28 @@ load_xml(const char *pathname) {
 	xml_loaded = true;
 }
 
+static void
+usage() {
+	
+	fputs(	"Usage: prompro [-d file] [-e eprom_type] [-h]\n"
+		"where:\n"
+		"\t-d file\t\tDownload EPROM to file\n"
+		"\t-e eprom_type\tSpecify configured eprom type\n"
+		"\t-v\t\tVerbose messages\n"
+		"\t-D\t\tEnable debugging output\n"
+		"\t-h\t\tThis info\n",
+		stdout);
+	exit(0);
+}
+
 int
 main(int argc,char **argv) {
 	std::string xml_path = getenv("HOME");
+	int optch;
+
+	//////////////////////////////////////////////////////////////
+	// Load from XML config file(s) for defaults
+	//////////////////////////////////////////////////////////////
 
 	xml_path += "/.prompro.xml";
 
@@ -199,11 +345,62 @@ main(int argc,char **argv) {
 		exit(1);
 	}
 
-	printf("Dev='%s', baud=%u, rtscts=%d, eprom=%s\n",
-		device.c_str(),
-		baud_rate,
-		rtscts,
-		eprom_type.c_str());
+	if ( cmd_debug )
+		printf("Dev='%s', baud=%u, rtscts=%d, eprom=%s\n",
+			device.c_str(),
+			baud_rate,
+			rtscts,
+			eprom_type.c_str());
+
+	//////////////////////////////////////////////////////////////
+	// Process command line arguments
+	//////////////////////////////////////////////////////////////
+
+	while ( (optch = getopt(argc, argv, ":hd:e:Dv")) != -1 ) {
+		switch ( optch ) {
+		case 'd':			// Download EPROM
+			download = optarg;
+			break;
+		case 'e':
+			eprom_type = optarg;
+			break;
+		case 'D':
+			cmd_debug = true;
+			break;
+		case 'v':
+			verbose = true;
+			break;
+		case 'h':
+			usage();
+			break;
+		case '?':
+			printf("Unknown option -%c\n", optopt);
+			exit(1);
+		default:
+			printf("Invalid argument '%c'\n",optch);
+			exit(1);
+		}
+	}
+
+	//////////////////////////////////////////////////////////////
+	// Check that the eprom type is known
+	//////////////////////////////////////////////////////////////
+
+	{
+		auto it = eproms.find(eprom_type);
+		if ( it == eproms.end() ) {
+			fprintf(stderr,"Unknown EPROM type '%s'\n",eprom_type.c_str());
+			exit(1);
+		}
+
+		eprom = &it->second;		
+		if ( verbose )
+			printf("EPROM Type: %s\n",eprom->name.c_str());
+	}
+
+	//////////////////////////////////////////////////////////////
+	// Open the serial device
+	//////////////////////////////////////////////////////////////
 
 	serial = open(device.c_str(),O_RDWR,0);
 	if ( serial == -1 ) {
@@ -243,7 +440,21 @@ main(int argc,char **argv) {
 		exit(4);
 	}
 
-	puts("Ready.");
+	//////////////////////////////////////////////////////////////
+	// Select EPROM type
+	//////////////////////////////////////////////////////////////
+
+	select_type();
+
+	puts("Place EPROM in socket, and press CR when ready:");
+	anykey();
+
+	//////////////////////////////////////////////////////////////
+	// Check for downloads
+	//////////////////////////////////////////////////////////////
+
+	if ( download != "" )
+		download_file(download.c_str());
 
 	close(serial);
 
