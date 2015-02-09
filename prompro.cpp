@@ -21,6 +21,7 @@
 #include <map>
 #include <vector>
 
+// static unsigned block_size = 2048;		// PROMPRO "block size"
 static bool cmd_debug = false;			// When true, show serial trafic for debugging
 static bool xml_loaded = false;
 static bool verbose = false;			// Verbose messages when true
@@ -38,6 +39,7 @@ static int serial = -1;
 struct s_segment {
 	std::string	ppname;			// Prompro name
 	unsigned	offset;			// Byte offset
+	std::string	title;			// As shown on PROMPRO-8
 };
 
 struct s_eprom_type {
@@ -193,17 +195,36 @@ select_type(const char *type) {
 		timeout("Selecting PROMPRO EPROM type");
 }
 
+#if 0
+static void
+relocate(unsigned addr) {
+	char buf[32];
+
+	sprintf(buf,"R%04X\r",addr);
+	writech(buf);
+	if ( !get_prompt(16000) )
+		timeout("Setting Relocation address");
+}
+#endif
+
+static void
+load() {
+	writech("L\r");
+	if ( !get_prompt(16000) )
+		timeout("Loading from EPROM.\n");
+}
+
 static void
 select_type(const s_segment& seg) {
 
 	if ( prompro_type != seg.ppname ) {
 		if ( verbose )
-			printf("Selecting PROMPRO type %s\n",seg.ppname.c_str());
+			printf("Selecting PROMPRO type %s (%s)\n",seg.ppname.c_str(),seg.title.c_str());
 		select_type(seg.ppname.c_str());
 		prompro_type = seg.ppname;
 	} else	{
 		if ( verbose )
-			printf("Continuing to use PROMPRO type %s\n",seg.ppname.c_str());
+			printf("Continuing to use PROMPRO type %s (%s)\n",seg.ppname.c_str(),seg.title.c_str());
 	}
 }
 
@@ -219,7 +240,6 @@ select_type() {
 	s_segment& seg = eprom->segs[0];
 	select_type(seg);
 }
-
 
 static void
 download_file(const char *path) {
@@ -238,8 +258,33 @@ download_file(const char *path) {
 
 	for ( auto it = eprom->segs.begin(); it != eprom->segs.end(); ++it ) {
 		const s_segment& seg = *it;
+		unsigned offset = seg.offset;
 
 		select_type(seg);
+		load();
+
+		int ch;
+		bool df = cmd_debug;
+
+		cmd_debug = false;
+
+		char cmd[32];
+
+		sprintf(cmd,"U%04X\r",offset);
+		writech(cmd);
+
+		do	{
+			ch = readch(5000);
+			fputc(ch,dfile);
+			putchar(ch);
+		} while ( ch != '*' );
+
+		fputc('\n',dfile);
+		fflush(dfile);
+
+		cmd_debug = df;
+
+		offset += eprom->segsize;
 	}
 
 	fclose(dfile);
